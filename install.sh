@@ -32,6 +32,7 @@ BIN_DIR="$PREFIX/bin"
 do_uninstall() {
     echo "🎵 Uninstalling music-rust by iapizarro from $PREFIX..."
     rm -f "$BIN_DIR/music-rust"
+    rm -f "$HOME/.cargo/bin/music-rust" 2>/dev/null || true
     rm -rf "$DEST_DIR"
     echo "======================================================="
     echo " Uninstallation successful!"
@@ -62,11 +63,21 @@ cp "$SCRIPT_DIR/target/release/music-rust" "$BIN_DIR/music-rust.new"
 chmod 755 "$BIN_DIR/music-rust.new"
 mv -f "$BIN_DIR/music-rust.new" "$BIN_DIR/music-rust"
 
+if [ -d "$HOME/.cargo/bin" ] && [ "$BIN_DIR" != "$HOME/.cargo/bin" ]; then
+    install -m 755 "$SCRIPT_DIR/target/release/music-rust" "$HOME/.cargo/bin/music-rust" 2>/dev/null || true
+fi
+
+# Ensure any legacy desktop launcher shortcut is cleaned up
+rm -f "$PREFIX/share/applications/music-rust.desktop"
+if command -v update-desktop-database >/dev/null 2>&1; then
+    update-desktop-database "$PREFIX/share/applications" 2>/dev/null || true
+fi
+
 echo "Cleaning build target cache to conserve disk space..."
 (cd "$SCRIPT_DIR" && cargo clean)
 
 echo "======================================================="
-echo " Installation successful! music-rust v0.1 is ready."
+echo " Installation successful! music-rust v0.2.0 is ready."
 if [[ ":$PATH:" != *":$BIN_DIR:"* ]]; then
     echo " Note: $BIN_DIR is not in your PATH. You may add it via:"
     echo "   export PATH=\"\$PATH:$BIN_DIR\""

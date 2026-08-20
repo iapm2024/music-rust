@@ -278,40 +278,49 @@ impl Player {
     }
 
     pub fn next(&mut self) -> color_eyre::Result<()> {
-        if let Some(idx) = self.current_track_index {
-            if !self.flat_playlist.is_empty() {
-                let next_idx = (idx + 1) % self.flat_playlist.len();
-                self.play_index(next_idx)?;
-            }
-        } else if !self.flat_playlist.is_empty() {
-            self.play_index(0)?;
+        if self.flat_playlist.is_empty() {
+            return Ok(());
         }
+        let current = self.current_track_index.unwrap_or(0);
+        let mut next_idx = (current + 1) % self.flat_playlist.len();
+        let mut attempts = 0;
+        while attempts < self.flat_playlist.len() {
+            if self.play_index(next_idx).is_ok() {
+                return Ok(());
+            }
+            next_idx = (next_idx + 1) % self.flat_playlist.len();
+            attempts += 1;
+        }
+        self.sink.stop();
+        self.current_track_index = None;
+        self.is_paused = false;
         Ok(())
     }
 
     pub fn previous(&mut self) -> color_eyre::Result<()> {
-        if let Some(idx) = self.current_track_index {
-            if !self.flat_playlist.is_empty() {
-                let prev_idx = if idx == 0 { self.flat_playlist.len() - 1 } else { idx - 1 };
-                self.play_index(prev_idx)?;
-            }
-        } else if !self.flat_playlist.is_empty() {
-            self.play_index(0)?;
+        if self.flat_playlist.is_empty() {
+            return Ok(());
         }
+        let current = self.current_track_index.unwrap_or(0);
+        let mut prev_idx = if current == 0 { self.flat_playlist.len() - 1 } else { current - 1 };
+        let mut attempts = 0;
+        while attempts < self.flat_playlist.len() {
+            if self.play_index(prev_idx).is_ok() {
+                return Ok(());
+            }
+            prev_idx = if prev_idx == 0 { self.flat_playlist.len() - 1 } else { prev_idx - 1 };
+            attempts += 1;
+        }
+        self.sink.stop();
+        self.current_track_index = None;
+        self.is_paused = false;
         Ok(())
     }
 
     pub fn tick(&mut self) {
         if !self.is_paused && self.current_track_index.is_some() {
-            // Check if track has finished playing (sink empty or duration exceeded)
-            let finished_by_sink = self.sink.empty();
-            let finished_by_time = if let Some(track) = self.current_track() {
-                track.duration > Duration::ZERO && self.current_elapsed_duration() >= track.duration
-            } else {
-                false
-            };
-
-            if finished_by_sink || finished_by_time {
+            // Check if track has finished playing via sink emptiness
+            if self.sink.empty() {
                 let _ = self.next();
             }
         }

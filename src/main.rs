@@ -73,7 +73,26 @@ fn update_mpris_state(controls: &mut MediaControls, player: &Player) {
     }
 }
 
+struct TerminalCleanup;
+
+impl Drop for TerminalCleanup {
+    fn drop(&mut self) {
+        let _ = disable_raw_mode();
+        let _ = execute!(std::io::stdout(), DisableMouseCapture, LeaveAlternateScreen, crossterm::cursor::Show);
+    }
+}
+
+fn install_panic_hook() {
+    let original_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |panic_info| {
+        let _ = disable_raw_mode();
+        let _ = execute!(std::io::stdout(), DisableMouseCapture, LeaveAlternateScreen, crossterm::cursor::Show);
+        original_hook(panic_info);
+    }));
+}
+
 fn main() -> color_eyre::Result<()> {
+    install_panic_hook();
     color_eyre::install()?;
     let args = Args::parse();
 
@@ -81,6 +100,7 @@ fn main() -> color_eyre::Result<()> {
     enable_raw_mode()?;
     let mut stdout = std::io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    let _cleanup = TerminalCleanup;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
@@ -208,19 +228,20 @@ fn main() -> color_eyre::Result<()> {
 
         // Selected Artist Filter
         let selected_artist_idx = artist_list_state.selected().unwrap_or(0);
-        let current_albums = if selected_artist_idx == 0 {
-            player.artists.iter().flat_map(|a| a.albums.clone()).collect::<Vec<_>>()
-        } else if let Some(artist) = player.artists.get(selected_artist_idx - 1) {
-            artist.albums.clone()
-        } else {
-            Vec::new()
-        };
 
         // 2. Build Right Column (Albums & Tracks for selected artist)
         let mut album_items: Vec<ListItem> = Vec::new();
         let mut row_to_track: Vec<Option<TrackInfo>> = Vec::new();
 
-        for album in &current_albums {
+        let album_iter: Box<dyn Iterator<Item = &player::AlbumGroup>> = if selected_artist_idx == 0 {
+            Box::new(player.artists.iter().flat_map(|a| &a.albums))
+        } else if let Some(artist) = player.artists.get(selected_artist_idx - 1) {
+            Box::new(artist.albums.iter())
+        } else {
+            Box::new(std::iter::empty())
+        };
+
+        for album in album_iter {
             // Album Header row
             album_items.push(ListItem::new(Line::from(vec![
                 Span::styled(" ", Style::default()),
@@ -432,7 +453,7 @@ fn main() -> color_eyre::Result<()> {
 
                 let mut about_text = vec![
                     Line::from(vec![
-                        Span::styled("MUSIC-RUST v0.1.0", Style::default().fg(NORD10).add_modifier(Modifier::BOLD)),
+                        Span::styled("MUSIC-RUST v0.2.0", Style::default().fg(NORD10).add_modifier(Modifier::BOLD)),
                     ]).alignment(Alignment::Center),
                     Line::from(vec![
                         Span::styled("Author: ", Style::default().fg(NORD9).add_modifier(Modifier::BOLD)),
@@ -700,7 +721,7 @@ fn main() -> color_eyre::Result<()> {
                         } else {
                             match key.code {
                                 KeyCode::Char('q') | KeyCode::Esc => running = false,
-                                KeyCode::Char('a') | KeyCode::Char('A') => show_about_modal = true,
+                                KeyCode::Char('a') | KeyCode::Char('A') | KeyCode::Char('?') => show_about_modal = true,
                                 KeyCode::Char('+') | KeyCode::Char('=') => player.volume_up(),
                                 KeyCode::Char('-') | KeyCode::Char('_') => player.volume_down(),
                                 KeyCode::Tab | KeyCode::Right | KeyCode::Left | KeyCode::Char('h') | KeyCode::Char('l') => {
