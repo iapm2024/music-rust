@@ -15,8 +15,8 @@ pub struct TrackInfo {
     pub album: String,
     pub duration: Duration,
     pub track_number: Option<u32>,
+    pub flat_index: usize,
 }
-
 
 #[derive(Debug, Clone)]
 pub struct AlbumGroup {
@@ -51,7 +51,6 @@ impl Player {
         let sink = Sink::try_new(&_stream_handle)?;
         let volume = 1.0; // Default 100% volume
         sink.set_volume(volume);
-
 
         Ok(Self {
             _stream,
@@ -157,6 +156,7 @@ impl Player {
                 album: album.clone(),
                 duration,
                 track_number,
+                flat_index: 0,
             };
 
             artist_map
@@ -185,7 +185,6 @@ impl Player {
                 });
             }
 
-
             self.artists.push(ArtistGroup {
                 name: artist_name,
                 albums: album_groups,
@@ -198,10 +197,13 @@ impl Player {
 
     pub fn rebuild_flat_playlist(&mut self) {
         self.flat_playlist.clear();
-        for artist in &self.artists {
-            for album in &artist.albums {
-                for track in &album.tracks {
+        let mut idx = 0;
+        for artist in &mut self.artists {
+            for album in &mut artist.albums {
+                for track in &mut album.tracks {
+                    track.flat_index = idx;
                     self.flat_playlist.push(track.clone());
+                    idx += 1;
                 }
             }
         }
@@ -216,7 +218,7 @@ impl Player {
         self.sink.set_volume(self.volume);
         self.sink.play();
         
-        self.current_track_index = self.flat_playlist.iter().position(|t| t.path == track.path);
+        self.current_track_index = Some(track.flat_index);
         self.is_paused = false;
         self.track_start_time = Some(Instant::now());
         self.elapsed_paused_duration = Duration::ZERO;
@@ -236,7 +238,7 @@ impl Player {
         if self.current_track_index.is_some() {
             if self.sink.try_seek(target_time).is_ok() {
                 let now = Instant::now();
-                self.track_start_time = Some(now - target_time);
+                self.track_start_time = now.checked_sub(target_time).or(Some(now));
                 self.elapsed_paused_duration = Duration::ZERO;
                 if self.is_paused {
                     self.pause_start_time = Some(now);
@@ -246,7 +248,6 @@ impl Player {
             }
         }
     }
-
 
     pub fn toggle_pause(&mut self) {
         if self.sink.is_paused() {
@@ -266,9 +267,9 @@ impl Player {
     pub fn current_elapsed_duration(&self) -> Duration {
         if let Some(start) = self.track_start_time {
             let total_elapsed = if let Some(pause_start) = self.pause_start_time {
-                pause_start.duration_since(start)
+                pause_start.saturating_duration_since(start)
             } else {
-                start.elapsed()
+                Instant::now().saturating_duration_since(start)
             };
             total_elapsed.saturating_sub(self.elapsed_paused_duration)
         } else {
@@ -330,4 +331,60 @@ impl Player {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
 
+    #[test]
+    fn test_track_info_instantiation() {
+        let track = TrackInfo {
+            path: PathBuf::from("/music/song.mp3"),
+            title: "Test Title".to_string(),
+            artist: "Test Artist".to_string(),
+            album: "Test Album".to_string(),
+            duration: Duration::from_secs(180),
+            track_number: Some(1),
+            flat_index: 0,
+        };
+        assert_eq!(track.title, "Test Title");
+        assert_eq!(track.duration.as_secs(), 180);
+        assert_eq!(track.flat_index, 0);
+    }
+
+    #[test]
+    fn test_album_and_artist_group_hierarchy() {
+        let track1 = TrackInfo {
+            path: PathBuf::from("/music/01.mp3"),
+            title: "Track 1".to_string(),
+            artist: "Artist A".to_string(),
+            album: "Album 1".to_string(),
+            duration: Duration::from_secs(120),
+            track_number: Some(1),
+            flat_index: 0,
+        };
+        let track2 = TrackInfo {
+            path: PathBuf::from("/music/02.mp3"),
+            title: "Track 2".to_string(),
+            artist: "Artist A".to_string(),
+            album: "Album 1".to_string(),
+            duration: Duration::from_secs(200),
+            track_number: Some(2),
+            flat_index: 1,
+        };
+
+        let album = AlbumGroup {
+            name: "Album 1".to_string(),
+            artist: "Artist A".to_string(),
+            tracks: vec![track1, track2],
+        };
+
+        let artist = ArtistGroup {
+            name: "Artist A".to_string(),
+            albums: vec![album],
+        };
+
+        assert_eq!(artist.albums.len(), 1);
+        assert_eq!(artist.albums[0].tracks.len(), 2);
+        assert_eq!(artist.albums[0].tracks[0].title, "Track 1");
+    }
+}

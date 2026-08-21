@@ -252,8 +252,8 @@ fn main() -> color_eyre::Result<()> {
 
             // Album Tracks
             for track in &album.tracks {
-                let flat_idx = player.flat_playlist.iter().position(|t| t.path == track.path);
-                let is_current = player.current_track_index == flat_idx && flat_idx.is_some();
+                let flat_idx = track.flat_index;
+                let is_current = player.current_track_index == Some(flat_idx);
 
                 let prefix = if is_current { "  ► " } else { "    " };
                 let track_style = if is_current {
@@ -266,7 +266,7 @@ fn main() -> color_eyre::Result<()> {
                     Span::styled(prefix, Style::default().fg(NORD14)),
                     Span::styled(&track.title, track_style),
                 ])));
-                row_to_track.push(flat_idx);
+                row_to_track.push(Some(flat_idx));
             }
         }
 
@@ -447,7 +447,7 @@ fn main() -> color_eyre::Result<()> {
 
                 let mut about_text = vec![
                     Line::from(vec![
-                        Span::styled("MUSIC-RUST v0.3.0", Style::default().fg(NORD10).add_modifier(Modifier::BOLD)),
+                        Span::styled(format!("MUSIC-RUST v{}", env!("CARGO_PKG_VERSION")), Style::default().fg(NORD10).add_modifier(Modifier::BOLD)),
                     ]).alignment(Alignment::Center),
                     Line::from(vec![
                         Span::styled("Author: ", Style::default().fg(NORD9).add_modifier(Modifier::BOLD)),
@@ -723,12 +723,17 @@ fn main() -> color_eyre::Result<()> {
                                 KeyCode::Char('a') | KeyCode::Char('A') | KeyCode::Char('?') => show_about_modal = true,
                                 KeyCode::Char('+') | KeyCode::Char('=') => player.volume_up(),
                                 KeyCode::Char('-') | KeyCode::Char('_') => player.volume_down(),
-                                KeyCode::Tab | KeyCode::Right | KeyCode::Left | KeyCode::Char('h') | KeyCode::Char('l') => {
-
+                                KeyCode::Tab => {
                                     active_focus = match active_focus {
                                         ActiveFocus::ArtistColumn => ActiveFocus::AlbumColumn,
                                         ActiveFocus::AlbumColumn => ActiveFocus::ArtistColumn,
                                     };
+                                }
+                                KeyCode::Left | KeyCode::Char('h') => {
+                                    active_focus = ActiveFocus::ArtistColumn;
+                                }
+                                KeyCode::Right | KeyCode::Char('l') => {
+                                    active_focus = ActiveFocus::AlbumColumn;
                                 }
                                 KeyCode::Char(' ') => player.toggle_pause(),
                                 KeyCode::Char('n') => {
