@@ -86,12 +86,15 @@ impl Player {
         self.flat_playlist.clear();
 
         let mut file_paths = Vec::new();
-        fn scan_dir(dir: &Path, paths: &mut Vec<PathBuf>) {
+        fn scan_dir(dir: &Path, paths: &mut Vec<PathBuf>, depth: usize) {
+            if depth > 16 {
+                return;
+            }
             if let Ok(entries) = fs::read_dir(dir) {
                 for entry in entries.flatten() {
                     let path = entry.path();
                     if path.is_dir() {
-                        scan_dir(&path, paths);
+                        scan_dir(&path, paths, depth + 1);
                     } else if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
                         let valid_exts = ["mp3", "flac", "wav", "ogg", "m4a", "aac", "opus", "wma"];
                         if valid_exts.iter().any(|&e| ext.eq_ignore_ascii_case(e)) {
@@ -103,14 +106,14 @@ impl Player {
         }
 
         if path.as_ref().is_dir() {
-            scan_dir(path.as_ref(), &mut file_paths);
+            scan_dir(path.as_ref(), &mut file_paths, 0);
         }
 
         let mut artist_map: BTreeMap<String, BTreeMap<String, Vec<TrackInfo>>> = BTreeMap::new();
 
         for file_path in file_paths {
             let mut title = file_path
-                .file_name()
+                .file_stem()
                 .and_then(|n| n.to_str())
                 .unwrap_or("Unknown Title")
                 .to_string();

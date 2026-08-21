@@ -79,7 +79,7 @@ Options:
 | `Mouse Click / Drag` (Progress) | Seek to track position |
 | `Mouse Click / Drag` (Volume) | Adjust volume level |
 | `Mouse Scroll` | Scroll lists / Adjust volume on controls |
-| `a` / `A` | Toggle About & Shortcuts overlay |
+| `a` / `A` / `?` | Toggle About & Shortcuts overlay |
 | `q` / `Esc` | Quit player |
 
 ## License

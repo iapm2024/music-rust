@@ -20,7 +20,7 @@ use ratatui::{
 use souvlaki::{MediaControlEvent, MediaControls, MediaMetadata, MediaPlayback, MediaPosition, PlatformConfig, SeekDirection};
 
 use theme::*;
-use player::{Player, TrackInfo};
+use player::Player;
 
 fn get_default_music_dir() -> PathBuf {
     if let Some(user_dirs) = std::env::var_os("HOME") {
@@ -231,7 +231,7 @@ fn main() -> color_eyre::Result<()> {
 
         // 2. Build Right Column (Albums & Tracks for selected artist)
         let mut album_items: Vec<ListItem> = Vec::new();
-        let mut row_to_track: Vec<Option<TrackInfo>> = Vec::new();
+        let mut row_to_track: Vec<Option<usize>> = Vec::new();
 
         let album_iter: Box<dyn Iterator<Item = &player::AlbumGroup>> = if selected_artist_idx == 0 {
             Box::new(player.artists.iter().flat_map(|a| &a.albums))
@@ -252,11 +252,8 @@ fn main() -> color_eyre::Result<()> {
 
             // Album Tracks
             for track in &album.tracks {
-                let is_current = player
-                    .current_track_index
-                    .and_then(|idx| player.flat_playlist.get(idx))
-                    .map(|curr| curr.path == track.path)
-                    .unwrap_or(false);
+                let flat_idx = player.flat_playlist.iter().position(|t| t.path == track.path);
+                let is_current = player.current_track_index == flat_idx && flat_idx.is_some();
 
                 let prefix = if is_current { "  ► " } else { "    " };
                 let track_style = if is_current {
@@ -269,7 +266,7 @@ fn main() -> color_eyre::Result<()> {
                     Span::styled(prefix, Style::default().fg(NORD14)),
                     Span::styled(&track.title, track_style),
                 ])));
-                row_to_track.push(Some(track.clone()));
+                row_to_track.push(flat_idx);
             }
         }
 
@@ -436,24 +433,21 @@ fn main() -> color_eyre::Result<()> {
 
             // 4. Render Modal About & Shortcuts Overlay if Active
             if show_about_modal {
-                let area = centered_rect_fixed(66, 16, f.area());
+                let area = centered_rect_fixed(66, 13, f.area());
                 f.render_widget(Clear, area);
 
                 let about_shortcuts = [
                     ("Tab, ←, →, h, l", "Switch Column"),
                     ("Space, Media Play", "Play / Pause"),
                     ("Enter, Double-Click", "Play Selected Song"),
-                    ("N / P, Media Next", "Next / Previous Track"),
                     ("+ / -, Mouse Wheel", "Volume Up / Down"),
-                    ("j / k, ↑ / ↓", "Navigate Lists"),
-                    ("Mouse Click / Drag", "Seek & Select Track"),
-                    ("A", "About & Shortcuts"),
+                    ("A, ?", "About & Shortcuts"),
                     ("Q, Esc", "Quit Application"),
                 ];
 
                 let mut about_text = vec![
                     Line::from(vec![
-                        Span::styled("MUSIC-RUST v0.2.0", Style::default().fg(NORD10).add_modifier(Modifier::BOLD)),
+                        Span::styled("MUSIC-RUST v0.3.0", Style::default().fg(NORD10).add_modifier(Modifier::BOLD)),
                     ]).alignment(Alignment::Center),
                     Line::from(vec![
                         Span::styled("Author: ", Style::default().fg(NORD9).add_modifier(Modifier::BOLD)),
@@ -549,8 +543,13 @@ fn main() -> color_eyre::Result<()> {
 
                                         // Play track if clicking an already selected song or on double click
                                         if is_double_click || was_already_selected {
-                                            if let Some(Some(track)) = row_to_track.get(target_idx) {
-                                                let _ = player.play_track(track);
+                                            if let Some(Some(track_idx)) = row_to_track.get(target_idx) {
+                                                let _ = player.play_index(*track_idx);
+                                            } else if is_double_click {
+                                                if let Some(Some(track_idx)) = row_to_track.get(target_idx + 1) {
+                                                    let _ = player.play_index(*track_idx);
+                                                    album_list_state.select(Some(target_idx + 1));
+                                                }
                                             }
                                         }
                                     }
@@ -684,7 +683,7 @@ fn main() -> color_eyre::Result<()> {
                     if key.kind == KeyEventKind::Press {
                         if show_about_modal {
                             match key.code {
-                                KeyCode::Esc | KeyCode::Char('a') | KeyCode::Char('A') | KeyCode::Enter | KeyCode::Char('q') => {
+                                KeyCode::Esc | KeyCode::Char('a') | KeyCode::Char('A') | KeyCode::Char('?') | KeyCode::Enter | KeyCode::Char('q') => {
                                     show_about_modal = false;
                                 }
                                 KeyCode::Media(media_key) => match media_key {
@@ -741,8 +740,13 @@ fn main() -> color_eyre::Result<()> {
                                 KeyCode::Enter => {
                                     if active_focus == ActiveFocus::AlbumColumn {
                                         if let Some(selected_row) = album_list_state.selected() {
-                                            if let Some(Some(track)) = row_to_track.get(selected_row) {
-                                                let _ = player.play_track(track);
+                                            if let Some(Some(track_idx)) = row_to_track.get(selected_row) {
+                                                let _ = player.play_index(*track_idx);
+                                            } else if let Some(None) = row_to_track.get(selected_row) {
+                                                if let Some(Some(track_idx)) = row_to_track.get(selected_row + 1) {
+                                                    let _ = player.play_index(*track_idx);
+                                                    album_list_state.select(Some(selected_row + 1));
+                                                }
                                             }
                                         }
                                     }

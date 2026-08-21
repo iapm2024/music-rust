@@ -47,8 +47,16 @@ fi
 check_deps() {
     if ! command -v cargo &> /dev/null; then
         echo "Error: Cargo is required but not installed."
-        echo "Please install Rust & Cargo (e.g. curl https://sh.rustup.rs -sSf | sh)."
+        echo "Please install Rust & Cargo (e.g. curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh)."
         exit 1
+    fi
+
+    if ! command -v pkg-config &> /dev/null; then
+        echo "Note: pkg-config not found. If the build fails, install system dependencies:"
+        echo "  Debian/Ubuntu: sudo apt install libasound2-dev libdbus-1-dev pkg-config"
+        echo "  Fedora:        sudo dnf install alsa-lib-devel dbus-devel pkgconf-pkg-config"
+        echo "  Arch Linux:    sudo pacman -S alsa-lib dbus pkgconf"
+        echo "  openSUSE:      sudo zypper install alsa-devel dbus-1-devel pkg-config"
     fi
 }
 
@@ -77,7 +85,7 @@ echo "Cleaning build target cache to conserve disk space..."
 (cd "$SCRIPT_DIR" && cargo clean)
 
 echo "======================================================="
-echo " Installation successful! music-rust v0.2.0 is ready."
+echo " Installation successful! music-rust v0.3.0 is ready."
 if [[ ":$PATH:" != *":$BIN_DIR:"* ]]; then
     echo " Note: $BIN_DIR is not in your PATH. You may add it via:"
     echo "   export PATH=\"\$PATH:$BIN_DIR\""
