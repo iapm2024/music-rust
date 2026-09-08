@@ -5,6 +5,9 @@
 ## Overview
 `music-rust` is a fast, lightweight, keyboard and mouse-driven terminal music player built using [ratatui](https://github.com/ratatui/ratatui) and [crossterm](https://github.com/crossterm-rs/crossterm). It decodes all standard audio formats (MP3, FLAC, OGG, WAV, AAC, M4A, OPUS, WMA) via Symphonia / rodio, and features full media key integration (MPRIS / Souvlaki).
 
+> **Inspiration**: This project was inspired by [musikcube](https://github.com/clangen/musikcube) by Casey Langen.
+
+
 ## Features
 - 🌲 **Nord Color Palette**: Polar Night, Snow Storm, Frost, and Aurora theme colors.
 - 🖱️ **Full Mouse Support**: Click artist/song rows, drag interactive seekbar, drag volume slider, and scroll lists.
@@ -104,7 +107,11 @@ Found a bug, have an audio decoding issue, or want to request a feature?
 - Open an issue on GitHub: [Issues Tracker](https://github.com/iapm2024/music-rust/issues)
 - Pull requests and suggestions are welcome!
 
+## Acknowledgements
+- [musikcube](https://github.com/clangen/musikcube) by Casey Langen — for the original inspiration of an elegant 24-bit terminal audio workstation.
+
 ## License
 Licensed under [GNU General Public License v3](LICENSE).  
 Author: iapizarro (iapm2024).
+
 
