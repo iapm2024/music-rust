@@ -12,6 +12,13 @@
 - 🎚️ **Format Support**: MP3, FLAC, OGG Vorbis, WAV, AAC, M4A, OPUS, WMA.
 - 🖥️ **OS Integration**: MPRIS media key support (Play/Pause, Next, Previous, Stop, Seek) for system media controls.
 
+## Screenshots
+
+| Main Music Player | About & Shortcuts Modal |
+| :---: | :---: |
+| ![Main Player](assets/screenshots/01_player.png) | ![About & Shortcuts](assets/screenshots/02_shortcuts.png) |
+
+
 ## Prerequisites
 
 ### 1. Rust & Cargo
