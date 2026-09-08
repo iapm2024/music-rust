@@ -21,6 +21,11 @@
 | :---: | :---: |
 | ![Main Player](assets/screenshots/01_player.png) | ![About & Shortcuts](assets/screenshots/02_shortcuts.png) |
 
+| Audio Metadata Editor |
+| :---: |
+| ![Edit Metadata](assets/screenshots/03_edit_metadata.png) |
+
+
 
 ## Prerequisites
 
