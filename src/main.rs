@@ -9,12 +9,13 @@ use crossterm::{
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
+use lofty::file::TaggedFileExt;
 use ratatui::{
     backend::CrosstermBackend,
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph},
+    widgets::{Block, BorderType, Borders, Clear, List, ListItem, ListState, Paragraph},
     Terminal,
 };
 use souvlaki::{MediaControlEvent, MediaControls, MediaMetadata, MediaPlayback, MediaPosition, PlatformConfig, SeekDirection};
@@ -44,6 +45,65 @@ struct Args {
 enum ActiveFocus {
     ArtistColumn,
     AlbumColumn,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MetaField {
+    Title,
+    Artist,
+    Album,
+    Genre,
+    Year,
+    TrackNumber,
+}
+
+impl MetaField {
+    const ALL: [MetaField; 6] = [
+        MetaField::Title,
+        MetaField::Artist,
+        MetaField::Album,
+        MetaField::Genre,
+        MetaField::Year,
+        MetaField::TrackNumber,
+    ];
+}
+
+#[derive(Debug, Clone)]
+struct MetadataEditState {
+    track_path: PathBuf,
+    field_idx: usize,
+    is_editing: bool,
+    cursor_pos: usize,
+    title: String,
+    artist: String,
+    album: String,
+    genre: String,
+    year: String,
+    track_number: String,
+}
+
+impl MetadataEditState {
+    fn current_field_str(&self) -> &str {
+        match MetaField::ALL[self.field_idx] {
+            MetaField::Title => &self.title,
+            MetaField::Artist => &self.artist,
+            MetaField::Album => &self.album,
+            MetaField::Genre => &self.genre,
+            MetaField::Year => &self.year,
+            MetaField::TrackNumber => &self.track_number,
+        }
+    }
+
+    fn current_field_str_mut(&mut self) -> &mut String {
+        match MetaField::ALL[self.field_idx] {
+            MetaField::Title => &mut self.title,
+            MetaField::Artist => &mut self.artist,
+            MetaField::Album => &mut self.album,
+            MetaField::Genre => &mut self.genre,
+            MetaField::Year => &mut self.year,
+            MetaField::TrackNumber => &mut self.track_number,
+        }
+    }
 }
 
 /// Helper function to create centered modal dialog Rect using exact width and height
@@ -85,15 +145,33 @@ impl Drop for TerminalCleanup {
 fn install_panic_hook() {
     let original_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |panic_info| {
-        let _ = disable_raw_mode();
-        let _ = execute!(std::io::stdout(), DisableMouseCapture, LeaveAlternateScreen, crossterm::cursor::Show);
+        let _ = std::panic::catch_unwind(|| {
+            let _ = disable_raw_mode();
+            let _ = execute!(std::io::stdout(), DisableMouseCapture, LeaveAlternateScreen, crossterm::cursor::Show);
+        });
         original_hook(panic_info);
     }));
+}
+
+/// Redirect stderr to /dev/null to prevent ALSA (and other C-level libraries)
+/// from printing underrun, buffer, or driver diagnostic messages directly to the
+/// terminal, which corrupts ratatui's raw-mode TUI screen.
+fn suppress_alsa_and_stderr_noise() {
+    #[cfg(unix)]
+    unsafe {
+        use std::fs::OpenOptions;
+        use std::os::unix::io::AsRawFd;
+
+        if let Ok(dev_null) = OpenOptions::new().write(true).open("/dev/null") {
+            let _ = libc::dup2(dev_null.as_raw_fd(), libc::STDERR_FILENO);
+        }
+    }
 }
 
 fn main() -> color_eyre::Result<()> {
     install_panic_hook();
     color_eyre::install()?;
+    suppress_alsa_and_stderr_noise();
     let args = Args::parse();
 
     // Terminal setup with Mouse Capture enabled
@@ -129,6 +207,7 @@ fn main() -> color_eyre::Result<()> {
     let mut artist_list_state = ListState::default();
     let mut album_list_state = ListState::default();
     let mut show_about_modal = false;
+    let mut metadata_edit_modal: Option<MetadataEditState> = None;
 
     if !player.artists.is_empty() {
         artist_list_state.select(Some(0)); // Select "All Artists"
@@ -138,6 +217,7 @@ fn main() -> color_eyre::Result<()> {
     }
 
     let mut running = true;
+    let app_start_time = std::time::Instant::now();
     let mut last_artist_rect = Rect::default();
     let mut last_album_rect = Rect::default();
     let mut last_progress_bar_x: u16 = 0;
@@ -152,6 +232,14 @@ fn main() -> color_eyre::Result<()> {
 
     let mut last_mpris_track_idx: Option<usize> = None;
     let mut last_mpris_paused: bool = false;
+
+    let mut status_message: Option<(String, std::time::Instant)> = None;
+    let mut artist_labels: Vec<String> = player.artists.iter().map(|artist| format!(" {}", artist.name)).collect();
+
+    let mut last_rendered_artist_idx: Option<usize> = None;
+    let mut last_rendered_track_idx: Option<usize> = None;
+    let mut cached_album_items: Vec<ListItem> = Vec::new();
+    let mut cached_row_to_track: Vec<Option<usize>> = Vec::new();
 
     while running {
         // Process MPRIS OS-level media control events (laptop media keys, playerctl, GNOME shell)
@@ -183,9 +271,7 @@ fn main() -> color_eyre::Result<()> {
                     let _ = player.previous();
                 }
                 MediaControlEvent::Stop => {
-                    if !player.is_paused && player.current_track_index.is_some() {
-                        player.toggle_pause();
-                    }
+                    player.stop();
                 }
                 MediaControlEvent::Seek(direction) => {
                     let cur = player.current_elapsed_duration();
@@ -219,59 +305,73 @@ fn main() -> color_eyre::Result<()> {
             }
         }
 
-        // 1. Build Left Column (Artists List)
-        let mut artist_items: Vec<ListItem> = Vec::new();
-        artist_items.push(ListItem::new(" All Artists").style(Style::default().fg(NORD8).add_modifier(Modifier::BOLD)));
-        for artist in &player.artists {
-            artist_items.push(ListItem::new(format!(" {}", artist.name)).style(Style::default().fg(NORD4)));
-        }
-
         // Selected Artist Filter
         let selected_artist_idx = artist_list_state.selected().unwrap_or(0);
 
-        // 2. Build Right Column (Albums & Tracks for selected artist)
-        let mut album_items: Vec<ListItem> = Vec::new();
-        let mut row_to_track: Vec<Option<usize>> = Vec::new();
+        // 2. Build Right Column (Albums & Tracks for selected artist) only when selection/track changes
+        if last_rendered_artist_idx != Some(selected_artist_idx) || last_rendered_track_idx != current_idx {
+            last_rendered_artist_idx = Some(selected_artist_idx);
+            last_rendered_track_idx = current_idx;
+            cached_album_items.clear();
+            cached_row_to_track.clear();
 
-        let album_iter: Box<dyn Iterator<Item = &player::AlbumGroup>> = if selected_artist_idx == 0 {
-            Box::new(player.artists.iter().flat_map(|a| &a.albums))
-        } else if let Some(artist) = player.artists.get(selected_artist_idx - 1) {
-            Box::new(artist.albums.iter())
-        } else {
-            Box::new(std::iter::empty())
-        };
-
-        for album in album_iter {
-            // Album Header row
-            album_items.push(ListItem::new(Line::from(vec![
-                Span::styled(" ", Style::default()),
-                Span::styled(&album.name, Style::default().fg(NORD8).add_modifier(Modifier::BOLD)),
-                Span::styled(format!(" • {}", album.artist), Style::default().fg(NORD4)),
-            ])).style(Style::default().bg(NORD1)));
-            row_to_track.push(None);
-
-            // Album Tracks
-            for track in &album.tracks {
-                let flat_idx = track.flat_index;
-                let is_current = player.current_track_index == Some(flat_idx);
-
-                let prefix = if is_current { "  ► " } else { "    " };
-                let track_style = if is_current {
-                    Style::default().fg(NORD14).add_modifier(Modifier::BOLD)
+            if player.artists.is_empty() {
+                cached_album_items.push(ListItem::new("  No music files found in music directory.").style(Style::default().fg(NORD3).add_modifier(Modifier::ITALIC)));
+                cached_row_to_track.push(None);
+            } else {
+                let album_iter: Box<dyn Iterator<Item = &player::AlbumGroup>> = if selected_artist_idx == 0 {
+                    Box::new(player.artists.iter().flat_map(|a| &a.albums))
+                } else if let Some(artist) = player.artists.get(selected_artist_idx.saturating_sub(1)) {
+                    Box::new(artist.albums.iter())
                 } else {
-                    Style::default().fg(NORD4)
+                    Box::new(std::iter::empty())
                 };
 
-                album_items.push(ListItem::new(Line::from(vec![
-                    Span::styled(prefix, Style::default().fg(NORD14)),
-                    Span::styled(&track.title, track_style),
-                ])));
-                row_to_track.push(Some(flat_idx));
+                for album in album_iter {
+                    // Album Header row
+                    cached_album_items.push(ListItem::new(Line::from(vec![
+                        Span::styled(" ", Style::default()),
+                        Span::styled(album.name.clone(), Style::default().fg(NORD8).add_modifier(Modifier::BOLD)),
+                        Span::styled(format!(" • {}", album.artist), Style::default().fg(NORD4)),
+                    ])).style(Style::default().bg(NORD1)));
+                    cached_row_to_track.push(None);
+
+                    // Album Tracks
+                    for track in &album.tracks {
+                        let flat_idx = track.flat_index;
+                        let is_current = current_idx == Some(flat_idx);
+
+                        let prefix = if is_current { "  ▶ " } else { "    " };
+                        let track_style = if is_current {
+                            Style::default().fg(NORD6).add_modifier(Modifier::BOLD)
+                        } else {
+                            Style::default().fg(NORD4)
+                        };
+
+                        cached_album_items.push(ListItem::new(Line::from(vec![
+                            Span::styled(prefix, Style::default().fg(NORD6)),
+                            Span::styled(track.title.clone(), track_style),
+                        ])));
+                        cached_row_to_track.push(Some(flat_idx));
+                    }
+                }
             }
         }
 
-        let total_artist_rows = artist_items.len();
-        let total_album_rows = album_items.len();
+        let total_artist_rows = artist_labels.len() + 1;
+        let total_album_rows = cached_album_items.len();
+        if total_album_rows > 0 {
+            if let Some(selected) = album_list_state.selected() {
+                if selected >= total_album_rows {
+                    album_list_state.select(Some(total_album_rows - 1));
+                }
+            } else {
+                album_list_state.select(Some(0));
+            }
+        } else {
+            album_list_state.select(None);
+        }
+        let row_to_track = &cached_row_to_track;
 
         terminal.draw(|f| {
             let chunks = Layout::default()
@@ -283,11 +383,26 @@ fn main() -> color_eyre::Result<()> {
                 ])
                 .split(f.area());
 
-            let header_p = Paragraph::new(Line::from(vec![
-                Span::styled("MUSIC-RUST", Style::default().fg(NORD8).add_modifier(Modifier::BOLD)),
-            ]))
-            .alignment(Alignment::Center)
-            .block(Block::default().borders(Borders::ALL).border_style(Style::default().fg(NORD9)));
+            let header_line = if let Some((ref msg, time)) = status_message {
+                if time.elapsed() < Duration::from_secs(3) {
+                    Line::from(vec![
+                        Span::styled("MUSIC-RUST  ", Style::default().fg(NORD8).add_modifier(Modifier::BOLD)),
+                        Span::styled(format!("•  {}", msg), Style::default().fg(NORD14).add_modifier(Modifier::BOLD)),
+                    ])
+                } else {
+                    Line::from(vec![
+                        Span::styled("MUSIC-RUST", Style::default().fg(NORD8).add_modifier(Modifier::BOLD)),
+                    ])
+                }
+            } else {
+                Line::from(vec![
+                    Span::styled("MUSIC-RUST", Style::default().fg(NORD8).add_modifier(Modifier::BOLD)),
+                ])
+            };
+
+            let header_p = Paragraph::new(header_line)
+                .alignment(Alignment::Center)
+                .block(Block::default().borders(Borders::ALL).border_style(Style::default().fg(NORD9)));
             f.render_widget(header_p, chunks[0]);
 
             // 2-Column Layout Split
@@ -304,33 +419,41 @@ fn main() -> color_eyre::Result<()> {
 
             // Left Column: Artists
             let artist_border_color = if active_focus == ActiveFocus::ArtistColumn { NORD8 } else { NORD3 };
-            let artist_widget = List::new(artist_items)
+            let artist_items_iter = std::iter::once(
+                ListItem::new(" All Artists").style(Style::default().fg(NORD8).add_modifier(Modifier::BOLD)),
+            )
+            .chain(artist_labels.iter().map(|name| {
+                ListItem::new(name.as_str()).style(Style::default().fg(NORD4))
+            }));
+            let artist_widget = List::new(artist_items_iter)
                 .block(Block::default().borders(Borders::ALL).border_style(Style::default().fg(artist_border_color)).title(" Artists "))
                 .highlight_style(Style::default().bg(NORD2).fg(NORD6).add_modifier(Modifier::BOLD));
             f.render_stateful_widget(artist_widget, main_columns[0], &mut artist_list_state);
 
             // Right Column: Albums & Tracks
             let album_border_color = if active_focus == ActiveFocus::AlbumColumn { NORD8 } else { NORD3 };
-            let album_widget = List::new(album_items)
+            let album_widget = List::new(cached_album_items.iter().cloned())
                 .block(Block::default().borders(Borders::ALL).border_style(Style::default().fg(album_border_color)).title(" Albums & Tracks "))
                 .highlight_style(Style::default().bg(NORD2).fg(NORD6).add_modifier(Modifier::BOLD));
             f.render_stateful_widget(album_widget, main_columns[1], &mut album_list_state);
 
             // 3. Now Playing & Playback Controls Box
             let (status_icon, status_color) = if player.is_paused {
-                (" ⏸ ", NORD13)
+                ("❚❚ ", NORD6)
             } else if player.current_track_index.is_some() {
-                (" ▶ ", NORD14)
+                ("▶ ", NORD6)
             } else {
-                (" ⏹ ", NORD3)
+                ("■ ", NORD3)
             };
 
             let now_playing_text = if let Some(track) = player.current_track() {
                 vec![
-                    Span::styled(status_icon, Style::default().fg(status_color).add_modifier(Modifier::BOLD)),
+                    Span::styled(status_icon, Style::default().fg(status_color)),
                     Span::styled(&track.title, Style::default().fg(NORD6).add_modifier(Modifier::BOLD)),
-                    Span::styled(format!(" by {}", track.artist), Style::default().fg(NORD8)),
-                    Span::styled(format!("  from {}", track.album), Style::default().fg(NORD7)),
+                    Span::styled(" • ", Style::default().fg(NORD3)),
+                    Span::styled(&track.artist, Style::default().fg(NORD8)),
+                    Span::styled(" • ", Style::default().fg(NORD3)),
+                    Span::styled(&track.album, Style::default().fg(NORD7)),
                 ]
             } else {
                 vec![
@@ -342,22 +465,29 @@ fn main() -> color_eyre::Result<()> {
             // Playback Progress Bar & Volume Slider Layout
             let elapsed = player.current_elapsed_duration();
             let total_dur = player.current_track().map(|t| t.duration).unwrap_or(std::time::Duration::ZERO);
-            
-            let elapsed_sec = elapsed.as_secs();
+            let remaining_dur = total_dur.saturating_sub(elapsed);
+
+            let elapsed_str = player::format_duration(elapsed);
+            let total_str = player::format_duration(total_dur);
+            let remaining_str = format!("(-{})", player::format_duration(remaining_dur));
+
             let total_sec = total_dur.as_secs();
-            let remaining_sec = total_sec.saturating_sub(elapsed_sec);
+            let elapsed_sec = elapsed.as_secs();
 
-            let elapsed_str = format!("{}:{:02}", elapsed_sec / 60, elapsed_sec % 60);
-            let total_str = format!("{}:{:02}", total_sec / 60, total_sec % 60);
-            let remaining_str = format!("(-{}:{:02})", remaining_sec / 60, remaining_sec % 60);
+            // Volume Indicator Bar (Vol: 100% [━━━━━━━━━━])
+            const VOL_FILLED: [&str; 11] = ["", "━", "━━", "━━━", "━━━━", "━━━━━", "━━━━━━", "━━━━━━━", "━━━━━━━━", "━━━━━━━━━", "━━━━━━━━━━"];
+            const VOL_EMPTY: [&str; 11] = ["──────────", "─────────", "────────", "───────", "──────", "─────", "────", "───", "──", "─", ""];
 
-            // Volume Indicator Bar (Vol: 100% [──────────])
             let vol_pct = (player.volume * 100.0).round() as u32;
             let vol_blocks = ((player.volume * 10.0).round() as usize).clamp(0, 10);
-            let vol_filled = "─".repeat(vol_blocks);
-            let vol_empty = "─".repeat(10 - vol_blocks);
+            let vol_filled = VOL_FILLED[vol_blocks];
+            let vol_empty = VOL_EMPTY[vol_blocks];
 
-            let vol_prefix = format!("Vol: {:3}% [", vol_pct);
+            let vol_prefix = if player.volume == 0.0 {
+                "Vol: MUTE [".to_string()
+            } else {
+                format!("Vol: {:3}% [", vol_pct)
+            };
             let vol_suffix = "]";
 
             let fixed_meta_len = (elapsed_str.len() + 2)
@@ -391,32 +521,36 @@ fn main() -> color_eyre::Result<()> {
             };
 
             let thumb_pos = (ratio * progress_width.saturating_sub(1) as f32).round() as usize;
-            let mut bar_chars = Vec::new();
+            let mut bar_chars = Vec::with_capacity(progress_width);
             for i in 0..progress_width {
                 if i == thumb_pos && player.current_track_index.is_some() {
-                    bar_chars.push(Span::styled("█", Style::default().fg(NORD4)));
+                    bar_chars.push(Span::styled("█", Style::default().fg(NORD6)));
                 } else if i < thumb_pos {
-                    bar_chars.push(Span::styled("─", Style::default().fg(NORD3)));
+                    bar_chars.push(Span::styled("━", Style::default().fg(NORD8)));
                 } else {
-                    bar_chars.push(Span::styled("─", Style::default().fg(NORD1)));
+                    bar_chars.push(Span::styled("─", Style::default().fg(NORD2)));
                 }
             }
 
             let mut progress_spans = vec![
-                Span::styled(format!(" {} ", elapsed_str), Style::default().fg(NORD3).add_modifier(Modifier::BOLD)),
+                Span::styled(format!(" {} ", elapsed_str), Style::default().fg(NORD4).add_modifier(Modifier::BOLD)),
             ];
             progress_spans.extend(bar_chars);
-            progress_spans.push(Span::styled(format!(" {} ", total_str), Style::default().fg(NORD3)));
-            progress_spans.push(Span::styled(format!(" {} ", remaining_str), Style::default().fg(NORD2)));
-            progress_spans.push(Span::styled(format!("  {}", vol_prefix), Style::default().fg(NORD3)));
-            progress_spans.push(Span::styled(vol_filled, Style::default().fg(NORD3).add_modifier(Modifier::BOLD)));
-            progress_spans.push(Span::styled(vol_empty, Style::default().fg(NORD1)));
-            progress_spans.push(Span::styled(vol_suffix, Style::default().fg(NORD3)));
+            progress_spans.push(Span::styled(format!(" {} ", total_str), Style::default().fg(NORD4)));
+            progress_spans.push(Span::styled(format!(" {} ", remaining_str), Style::default().fg(NORD3)));
+            progress_spans.push(Span::styled(format!("  {}", vol_prefix), Style::default().fg(NORD4)));
+            progress_spans.push(Span::styled(vol_filled, Style::default().fg(NORD8)));
+            progress_spans.push(Span::styled(vol_empty, Style::default().fg(NORD2)));
+            progress_spans.push(Span::styled(vol_suffix, Style::default().fg(NORD4)));
 
-            let playback_border_color = if player.current_track_index.is_some() && !player.is_paused {
-                NORD8
+            let is_playing = player.current_track_index.is_some() && !player.is_paused;
+            let (playback_border_color, playback_border_type) = if is_playing {
+                let elapsed_secs = app_start_time.elapsed().as_secs_f32();
+                (theme::get_breathing_playback_color(elapsed_secs), BorderType::Thick)
+            } else if player.is_paused && player.current_track_index.is_some() {
+                (NORD9, BorderType::Plain)
             } else {
-                NORD3
+                (NORD3, BorderType::Plain)
             };
 
             let playback_paragraph = Paragraph::new(vec![
@@ -426,6 +560,7 @@ fn main() -> color_eyre::Result<()> {
             .block(
                 Block::default()
                     .borders(Borders::ALL)
+                    .border_type(playback_border_type)
                     .border_style(Style::default().fg(playback_border_color))
                     .title(" Now Playing "),
             );
@@ -433,16 +568,22 @@ fn main() -> color_eyre::Result<()> {
 
             // 4. Render Modal About & Shortcuts Overlay if Active
             if show_about_modal {
-                let area = centered_rect_fixed(66, 13, f.area());
+                let area = centered_rect_fixed(68, 19, f.area());
                 f.render_widget(Clear, area);
 
                 let about_shortcuts = [
-                    ("Tab, ←, →, h, l", "Switch Column"),
-                    ("Space, Media Play", "Play / Pause"),
-                    ("Enter, Double-Click", "Play Selected Song"),
-                    ("+ / -, Mouse Wheel", "Volume Up / Down"),
-                    ("A, ?", "About & Shortcuts"),
-                    ("Q, Esc", "Quit Application"),
+                    ("↑ / ↓", "Move Selection"),
+                    ("Tab / Esc", "Switch Column Focus"),
+                    ("Space", "Play / Pause"),
+                    ("Enter", "Play Track / Artist"),
+                    ("n / p", "Next / Previous Track"),
+                    ("[ / ]", "Seek -5s / +5s"),
+                    ("+ / -", "Volume Up / Down"),
+                    ("m", "Mute / Unmute"),
+                    ("s / r / F5", "Scan Music Folder"),
+                    ("x", "Stop Playback"),
+                    ("e", "Edit Track Metadata"),
+                    ("q", "Quit Application"),
                 ];
 
                 let mut about_text = vec![
@@ -459,7 +600,7 @@ fn main() -> color_eyre::Result<()> {
                     Line::from(""),
                     Line::from(vec![
                         Span::styled("──────────── ", Style::default().fg(NORD10)),
-                        Span::styled("Keyboard & Mouse Shortcuts", Style::default().fg(NORD7).add_modifier(Modifier::BOLD)),
+                        Span::styled("Keyboard Shortcuts", Style::default().fg(NORD7).add_modifier(Modifier::BOLD)),
                         Span::styled(" ────────────", Style::default().fg(NORD10)),
                     ]).alignment(Alignment::Center),
                     Line::from(""),
@@ -468,8 +609,8 @@ fn main() -> color_eyre::Result<()> {
                 for (keys, desc) in about_shortcuts {
                     about_text.push(Line::from(vec![
                         Span::styled("      ", Style::default()),
-                        Span::styled(format!("{:<25}", keys), Style::default().fg(NORD10).add_modifier(Modifier::BOLD)),
-                        Span::styled(format!("{:<24}", desc), Style::default().fg(NORD5)),
+                        Span::styled(format!("{:<20}", keys), Style::default().fg(NORD10).add_modifier(Modifier::BOLD)),
+                        Span::styled(format!("{:<26}", desc), Style::default().fg(NORD5)),
                     ]));
                 }
 
@@ -482,6 +623,166 @@ fn main() -> color_eyre::Result<()> {
                     );
 
                 f.render_widget(about_popup, area);
+            }
+
+            // 5. Render Metadata Edit Modal if Active
+            if let Some(ref edit_state) = metadata_edit_modal {
+                let area = centered_rect_fixed(84, 16, f.area());
+                f.render_widget(Clear, area);
+
+                let block = Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(META_ROSE_PINK))
+                    .style(Style::default().bg(NORD0));
+                f.render_widget(block, area);
+
+                let modal_chunks = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([
+                        Constraint::Length(3), // Header
+                        Constraint::Length(8), // 6 Metadata Fields
+                        Constraint::Length(2), // Help / Instructions footer
+                    ])
+                    .margin(1)
+                    .split(area);
+
+                // Header
+                let file_name = edit_state
+                    .track_path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("Track");
+
+                let max_name_len = 38;
+                let display_file_name = if file_name.chars().count() > max_name_len {
+                    let mut s: String = file_name.chars().take(max_name_len - 3).collect();
+                    s.push_str("...");
+                    s
+                } else {
+                    file_name.to_string()
+                };
+
+                let header_lines = vec![
+                    Line::from(vec![
+                        Span::styled("EDIT METADATA", Style::default().fg(META_LIGHT_LILAC).add_modifier(Modifier::BOLD)),
+                    ]).alignment(Alignment::Center),
+                    Line::from(vec![
+                        Span::styled("File: ", Style::default().fg(META_ROSE_PINK).add_modifier(Modifier::BOLD)),
+                        Span::styled(display_file_name, Style::default().fg(META_SNOW_MID)),
+                        Span::styled("   •   ", Style::default().fg(META_DEEP_MAUVE)),
+                        Span::styled("App: ", Style::default().fg(META_ROSE_PINK).add_modifier(Modifier::BOLD)),
+                        Span::styled(format!("music-rust v{}", env!("CARGO_PKG_VERSION")), Style::default().fg(META_SNOW_MID)),
+                    ]).alignment(Alignment::Center),
+                    Line::from(vec![
+                        Span::styled("──────────── ", Style::default().fg(META_DEEP_MAUVE)),
+                        Span::styled("Audio Tags", Style::default().fg(META_LIGHT_LILAC).add_modifier(Modifier::BOLD)),
+                        Span::styled(" ────────────", Style::default().fg(META_DEEP_MAUVE)),
+                    ]).alignment(Alignment::Center),
+                ];
+                let header_p = Paragraph::new(header_lines).style(Style::default().bg(NORD0));
+                f.render_widget(header_p, modal_chunks[0]);
+
+                // Fields List
+                let mut field_lines = Vec::new();
+                for (idx, field) in MetaField::ALL.iter().enumerate() {
+                    let is_selected = edit_state.field_idx == idx;
+                    let num_str = format!("{}. ", idx + 1);
+                    let row_bg = if is_selected { META_BG_ACTIVE } else { NORD0 };
+
+                    let label_style = if is_selected {
+                        Style::default().bg(row_bg).fg(META_SNOW_BRIGHT).add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().bg(row_bg).fg(META_SNOW_MID)
+                    };
+
+                    let val_style = if is_selected {
+                        Style::default().bg(row_bg).fg(META_SNOW_BRIGHT).add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().bg(row_bg).fg(META_SNOW_MAIN)
+                    };
+
+                    let cursor_str = if is_selected { "  > " } else { "    " };
+                    let cursor_style = if is_selected {
+                        Style::default().bg(row_bg).fg(META_LIGHT_LILAC).add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().bg(row_bg).fg(NORD3)
+                    };
+
+                    let marker_style = Style::default().bg(row_bg).fg(META_ROSE_PINK).add_modifier(Modifier::BOLD);
+                    let num_style = Style::default().bg(row_bg).fg(if is_selected { META_ROSE_PINK } else { META_MUTED_PURPLE });
+
+                    let (label, val_str) = match field {
+                        MetaField::Title => ("Track Title:    ", edit_state.title.as_str()),
+                        MetaField::Artist => ("Track Artist:   ", edit_state.artist.as_str()),
+                        MetaField::Album => ("Album Name:     ", edit_state.album.as_str()),
+                        MetaField::Genre => ("Genre:          ", edit_state.genre.as_str()),
+                        MetaField::Year => ("Release Year:   ", edit_state.year.as_str()),
+                        MetaField::TrackNumber => ("Track Number:   ", edit_state.track_number.as_str()),
+                    };
+
+                    let max_val_len = 54;
+                    let display_val = if is_selected && edit_state.is_editing {
+                        let chars: Vec<char> = val_str.chars().collect();
+                        let pos = edit_state.cursor_pos.min(chars.len());
+                        let mut with_cursor = String::new();
+                        with_cursor.extend(chars[..pos].iter());
+                        with_cursor.push('_');
+                        with_cursor.extend(chars[pos..].iter());
+
+                        if with_cursor.chars().count() > max_val_len {
+                            let s: String = with_cursor.chars().skip(with_cursor.chars().count() - max_val_len).collect();
+                            s
+                        } else {
+                            with_cursor
+                        }
+                    } else if val_str.is_empty() {
+                        "---".to_string()
+                    } else if val_str.chars().count() > max_val_len {
+                        let mut s: String = val_str.chars().take(max_val_len - 3).collect();
+                        s.push_str("...");
+                        s
+                    } else {
+                        val_str.to_string()
+                    };
+
+                    field_lines.push(Line::from(vec![
+                        Span::styled(cursor_str, cursor_style),
+                        Span::styled("§ ", marker_style),
+                        Span::styled(num_str, num_style),
+                        Span::styled(label, label_style),
+                        Span::styled(display_val, val_style),
+                    ]));
+                }
+
+                let fields_p = Paragraph::new(field_lines).style(Style::default().bg(NORD0));
+                f.render_widget(fields_p, modal_chunks[1]);
+
+                // Footer instructions
+                let footer_line = if edit_state.is_editing {
+                    Line::from(vec![
+                        Span::styled("← / →: ", Style::default().fg(META_ROSE_PINK).add_modifier(Modifier::BOLD)),
+                        Span::styled("Move cursor", Style::default().fg(META_SNOW_MID)),
+                        Span::styled("  •  ", Style::default().fg(META_DEEP_MAUVE)),
+                        Span::styled("Enter: ", Style::default().fg(META_ROSE_PINK).add_modifier(Modifier::BOLD)),
+                        Span::styled("Done field", Style::default().fg(META_SNOW_MID)),
+                        Span::styled("  •  ", Style::default().fg(META_DEEP_MAUVE)),
+                        Span::styled("Esc: ", Style::default().fg(META_ROSE_PINK).add_modifier(Modifier::BOLD)),
+                        Span::styled("Save & Close", Style::default().fg(META_LIGHT_LILAC).add_modifier(Modifier::BOLD)),
+                    ]).alignment(Alignment::Center)
+                } else {
+                    Line::from(vec![
+                        Span::styled("↑ / ↓: ", Style::default().fg(META_ROSE_PINK).add_modifier(Modifier::BOLD)),
+                        Span::styled("Navigate", Style::default().fg(META_SNOW_MID)),
+                        Span::styled("  •  ", Style::default().fg(META_DEEP_MAUVE)),
+                        Span::styled("Enter: ", Style::default().fg(META_ROSE_PINK).add_modifier(Modifier::BOLD)),
+                        Span::styled("Edit field", Style::default().fg(META_SNOW_MID)),
+                        Span::styled("  •  ", Style::default().fg(META_DEEP_MAUVE)),
+                        Span::styled("Ctrl+S / Esc: ", Style::default().fg(META_ROSE_PINK).add_modifier(Modifier::BOLD)),
+                        Span::styled("Auto-Save & Close", Style::default().fg(META_LIGHT_LILAC).add_modifier(Modifier::BOLD)),
+                    ]).alignment(Alignment::Center)
+                };
+                let footer_p = Paragraph::new(vec![Line::from(""), footer_line]).style(Style::default().bg(NORD0));
+                f.render_widget(footer_p, modal_chunks[2]);
             }
         })?;
 
@@ -496,6 +797,8 @@ fn main() -> color_eyre::Result<()> {
                         if mouse_event.kind == MouseEventKind::Down(MouseButton::Left) {
                             show_about_modal = false;
                         }
+                    } else if metadata_edit_modal.is_some() {
+                        // In edit modal, keep mouse clicks from messing with background selection
                     } else {
                         let mx = mouse_event.column;
                         let my = mouse_event.row;
@@ -516,7 +819,7 @@ fn main() -> color_eyre::Result<()> {
                                     if target_idx < total_artist_rows {
                                         if artist_list_state.selected() != Some(target_idx) {
                                             artist_list_state.select(Some(target_idx));
-                                            album_list_state.select(Some(0));
+                                            album_list_state.select(Some(1));
                                         }
                                     }
                                 }
@@ -567,6 +870,9 @@ fn main() -> color_eyre::Result<()> {
                                             let ratio = (rel_x / (last_progress_bar_width as f32 - 1.0).max(1.0)).clamp(0.0, 1.0);
                                             let target_dur = Duration::from_secs_f32(ratio * total_sec);
                                             player.seek_to(target_dur);
+                                            if let Some(controls) = media_controls.as_mut() {
+                                                update_mpris_state(controls, &player);
+                                            }
                                         }
                                     }
                                 }
@@ -582,7 +888,11 @@ fn main() -> color_eyre::Result<()> {
                                 }
                                 // 5. Check if click is on Now Playing info bar
                                 else if my == last_now_playing_y {
-                                    player.toggle_pause();
+                                    if player.current_track_index.is_some() {
+                                        player.toggle_pause();
+                                    } else if !player.flat_playlist.is_empty() {
+                                        let _ = player.play_index(0);
+                                    }
                                 }
                             }
                             MouseEventKind::Drag(MouseButton::Left) => {
@@ -599,6 +909,9 @@ fn main() -> color_eyre::Result<()> {
                                                 let ratio = (rel_x / (last_progress_bar_width as f32 - 1.0).max(1.0)).clamp(0.0, 1.0);
                                                 let target_dur = Duration::from_secs_f32(ratio * total_sec);
                                                 player.seek_to(target_dur);
+                                                if let Some(controls) = media_controls.as_mut() {
+                                                    update_mpris_state(controls, &player);
+                                                }
                                             }
                                         }
                                     } else if last_vol_bar_width > 0
@@ -631,7 +944,7 @@ fn main() -> color_eyre::Result<()> {
                                         let next = (curr + 1).min(total_artist_rows - 1);
                                         if next != curr {
                                             artist_list_state.select(Some(next));
-                                            album_list_state.select(Some(0));
+                                            album_list_state.select(Some(1));
                                         }
                                     }
                                 } else {
@@ -663,7 +976,7 @@ fn main() -> color_eyre::Result<()> {
                                         let prev = curr.saturating_sub(1);
                                         if prev != curr {
                                             artist_list_state.select(Some(prev));
-                                            album_list_state.select(Some(0));
+                                            album_list_state.select(Some(1));
                                         }
                                     }
                                 } else {
@@ -683,8 +996,11 @@ fn main() -> color_eyre::Result<()> {
                     if key.kind == KeyEventKind::Press {
                         if show_about_modal {
                             match key.code {
-                                KeyCode::Esc | KeyCode::Char('a') | KeyCode::Char('A') | KeyCode::Char('?') | KeyCode::Enter | KeyCode::Char('q') => {
+                                KeyCode::Esc | KeyCode::Char('a') | KeyCode::Char('A') | KeyCode::Char('?') | KeyCode::Enter | KeyCode::Char('q') | KeyCode::Char(' ') => {
                                     show_about_modal = false;
+                                }
+                                KeyCode::Char('c') if key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL) => {
+                                    running = false;
                                 }
                                 KeyCode::Media(media_key) => match media_key {
                                     MediaKeyCode::Play
@@ -709,20 +1025,285 @@ fn main() -> color_eyre::Result<()> {
                                         player.volume_down();
                                     }
                                     MediaKeyCode::Stop => {
-                                        if !player.is_paused && player.current_track_index.is_some() {
-                                            player.toggle_pause();
-                                        }
+                                        player.stop();
                                     }
                                     _ => {}
                                 },
                                 _ => {}
                             }
+                        } else if let Some(ref mut edit_state) = metadata_edit_modal {
+                            let mut should_save_and_close = false;
+                            let mut should_discard_and_close = false;
+
+                            if edit_state.is_editing {
+                                match key.code {
+                                    KeyCode::Enter => {
+                                        edit_state.is_editing = false;
+                                    }
+                                    KeyCode::Esc => {
+                                        edit_state.is_editing = false;
+                                        should_save_and_close = true;
+                                    }
+                                    KeyCode::Left => {
+                                        if key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL) {
+                                            // Jump word left
+                                            let field_str = edit_state.current_field_str();
+                                            let chars: Vec<char> = field_str.chars().collect();
+                                            let mut pos = edit_state.cursor_pos.min(chars.len());
+                                            while pos > 0 && chars[pos - 1].is_whitespace() {
+                                                pos -= 1;
+                                            }
+                                            while pos > 0 && !chars[pos - 1].is_whitespace() {
+                                                pos -= 1;
+                                            }
+                                            edit_state.cursor_pos = pos;
+                                        } else {
+                                            edit_state.cursor_pos = edit_state.cursor_pos.saturating_sub(1);
+                                        }
+                                    }
+                                    KeyCode::Right => {
+                                        let field_str = edit_state.current_field_str();
+                                        let total_chars = field_str.chars().count();
+                                        if key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL) {
+                                            // Jump word right
+                                            let chars: Vec<char> = field_str.chars().collect();
+                                            let mut pos = edit_state.cursor_pos.min(chars.len());
+                                            while pos < total_chars && !chars[pos].is_whitespace() {
+                                                pos += 1;
+                                            }
+                                            while pos < total_chars && chars[pos].is_whitespace() {
+                                                pos += 1;
+                                            }
+                                            edit_state.cursor_pos = pos;
+                                        } else if edit_state.cursor_pos < total_chars {
+                                            edit_state.cursor_pos += 1;
+                                        }
+                                    }
+                                    KeyCode::Home => {
+                                        edit_state.cursor_pos = 0;
+                                    }
+                                    KeyCode::End => {
+                                        let field_str = edit_state.current_field_str();
+                                        edit_state.cursor_pos = field_str.chars().count();
+                                    }
+                                    KeyCode::Backspace => {
+                                        let pos = edit_state.cursor_pos;
+                                        if pos > 0 {
+                                            let field_str = edit_state.current_field_str_mut();
+                                            let mut chars: Vec<char> = field_str.chars().collect();
+                                            if pos <= chars.len() {
+                                                chars.remove(pos - 1);
+                                                *field_str = chars.into_iter().collect();
+                                                edit_state.cursor_pos = pos - 1;
+                                            }
+                                        }
+                                    }
+                                    KeyCode::Delete => {
+                                        let pos = edit_state.cursor_pos;
+                                        let field_str = edit_state.current_field_str_mut();
+                                        let mut chars: Vec<char> = field_str.chars().collect();
+                                        if pos < chars.len() {
+                                            chars.remove(pos);
+                                            *field_str = chars.into_iter().collect();
+                                        }
+                                    }
+                                    KeyCode::Char(c) => {
+                                        let is_numeric = matches!(
+                                            MetaField::ALL[edit_state.field_idx],
+                                            MetaField::Year | MetaField::TrackNumber
+                                        );
+                                        if !is_numeric || c.is_ascii_digit() {
+                                            let pos = edit_state.cursor_pos;
+                                            let field_str = edit_state.current_field_str_mut();
+                                            let mut chars: Vec<char> = field_str.chars().collect();
+                                            let insert_idx = pos.min(chars.len());
+                                            chars.insert(insert_idx, c);
+                                            *field_str = chars.into_iter().collect();
+                                            edit_state.cursor_pos = insert_idx + 1;
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            } else {
+                                match key.code {
+                                    KeyCode::Esc => {
+                                        should_save_and_close = true;
+                                    }
+                                    KeyCode::Char('q') => {
+                                        should_discard_and_close = true;
+                                    }
+                                    KeyCode::Up | KeyCode::Char('k') => {
+                                        if edit_state.field_idx == 0 {
+                                            edit_state.field_idx = MetaField::ALL.len() - 1;
+                                        } else {
+                                            edit_state.field_idx -= 1;
+                                        }
+                                    }
+                                    KeyCode::Down | KeyCode::Char('j') => {
+                                        edit_state.field_idx = (edit_state.field_idx + 1) % MetaField::ALL.len();
+                                    }
+                                    KeyCode::Enter => {
+                                        edit_state.is_editing = true;
+                                        edit_state.cursor_pos = edit_state.current_field_str().chars().count();
+                                    }
+                                    KeyCode::Char('s') if key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL) => {
+                                        should_save_and_close = true;
+                                    }
+                                    _ => {}
+                                }
+                            }
+
+                            if should_save_and_close {
+                                let path = edit_state.track_path.clone();
+                                let title = edit_state.title.clone();
+                                let artist = edit_state.artist.clone();
+                                let album = edit_state.album.clone();
+                                let genre = edit_state.genre.clone();
+                                let year = edit_state.year.trim().parse::<u32>().ok();
+                                let track_num = edit_state.track_number.trim().parse::<u32>().ok();
+
+                                match player.update_track_metadata(
+                                    &path,
+                                    &title,
+                                    &artist,
+                                    &album,
+                                    &genre,
+                                    year,
+                                    track_num,
+                                ) {
+                                    Ok(_) => {
+                                        let prev_artist_idx = artist_list_state.selected().unwrap_or(0);
+                                        let prev_artist_name = if prev_artist_idx == 0 {
+                                            None
+                                        } else {
+                                            player.artists.get(prev_artist_idx.saturating_sub(1)).map(|a| a.name.clone())
+                                        };
+
+                                        let _ = player.rescan_directory(&args.music_dir);
+                                        artist_labels = player.artists.iter().map(|artist| format!(" {}", artist.name)).collect();
+
+                                        if let Some(ref name) = prev_artist_name {
+                                            let new_idx = player.artists.iter().position(|a| &a.name == name).map(|i| i + 1).unwrap_or(0);
+                                            artist_list_state.select(Some(new_idx));
+                                        } else if !player.artists.is_empty() {
+                                            artist_list_state.select(Some(0));
+                                        } else {
+                                            artist_list_state.select(None);
+                                        }
+
+                                        last_rendered_artist_idx = None;
+                                        last_rendered_track_idx = None;
+
+                                        status_message = Some((
+                                            format!("Saved metadata for {}", title),
+                                            std::time::Instant::now(),
+                                        ));
+                                        metadata_edit_modal = None;
+                                    }
+                                    Err(err) => {
+                                        status_message = Some((
+                                            format!("Error saving tags: {}", err),
+                                            std::time::Instant::now(),
+                                        ));
+                                    }
+                                }
+                            } else if should_discard_and_close {
+                                metadata_edit_modal = None;
+                            }
                         } else {
                             match key.code {
-                                KeyCode::Char('q') | KeyCode::Esc => running = false,
+                                KeyCode::Char('q') => running = false,
+                                KeyCode::Char('c') if key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL) => running = false,
+                                KeyCode::Esc => {
+                                    active_focus = match active_focus {
+                                        ActiveFocus::ArtistColumn => ActiveFocus::AlbumColumn,
+                                        ActiveFocus::AlbumColumn => ActiveFocus::ArtistColumn,
+                                    };
+                                }
                                 KeyCode::Char('a') | KeyCode::Char('A') | KeyCode::Char('?') => show_about_modal = true,
                                 KeyCode::Char('+') | KeyCode::Char('=') => player.volume_up(),
                                 KeyCode::Char('-') | KeyCode::Char('_') => player.volume_down(),
+                                KeyCode::Char('m') | KeyCode::Char('M') => player.toggle_mute(),
+                                KeyCode::Char('x') | KeyCode::Char('X') => player.stop(),
+                                KeyCode::Char('s') | KeyCode::Char('S') | KeyCode::Char('r') | KeyCode::Char('R') | KeyCode::F(5) => {
+                                    let prev_artist_idx = artist_list_state.selected().unwrap_or(0);
+                                    let prev_artist_name = if prev_artist_idx == 0 {
+                                        None
+                                    } else {
+                                        player.artists.get(prev_artist_idx.saturating_sub(1)).map(|a| a.name.clone())
+                                    };
+
+                                    let _ = player.rescan_directory(&args.music_dir);
+                                    artist_labels = player.artists.iter().map(|artist| format!(" {}", artist.name)).collect();
+
+                                    if let Some(ref name) = prev_artist_name {
+                                        let new_idx = player.artists.iter().position(|a| &a.name == name).map(|i| i + 1).unwrap_or(0);
+                                        artist_list_state.select(Some(new_idx));
+                                    } else if !player.artists.is_empty() {
+                                        artist_list_state.select(Some(0));
+                                    } else {
+                                        artist_list_state.select(None);
+                                    }
+
+                                    last_rendered_artist_idx = None;
+                                    last_rendered_track_idx = None;
+
+                                    status_message = Some((
+                                        format!("Scanned music folder ({} tracks)", player.flat_playlist.len()),
+                                        std::time::Instant::now(),
+                                    ));
+                                }
+                                KeyCode::Char('0') => player.restart_track(),
+                                KeyCode::Char('e') | KeyCode::Char('E') => {
+                                    // Open metadata editor for selected track
+                                    let target_track_idx = match active_focus {
+                                        ActiveFocus::AlbumColumn => {
+                                            album_list_state.selected().and_then(|row| {
+                                                row_to_track.get(row).copied().flatten().or_else(|| {
+                                                    // If selecting an album header, select the first track under that album
+                                                    row_to_track.get(row + 1).copied().flatten()
+                                                })
+                                            })
+                                        }
+                                        ActiveFocus::ArtistColumn => {
+                                            // Fallback to currently playing, or first track of the current view
+                                            player.current_track_index.or_else(|| {
+                                                row_to_track.iter().flatten().copied().next()
+                                            })
+                                        }
+                                    }.or(player.current_track_index);
+
+                                    if let Some(track_idx) = target_track_idx {
+                                        if let Some(track) = player.flat_playlist.get(track_idx) {
+                                            let mut genre = String::new();
+                                            let mut year_str = String::new();
+                                            if let Ok(tagged) = lofty::probe::Probe::open(&track.path).and_then(|p| p.read()) {
+                                                if let Some(tag) = tagged.primary_tag().or_else(|| tagged.first_tag()) {
+                                                    use lofty::tag::Accessor;
+                                                    if let Some(g) = tag.genre() {
+                                                        genre = g.trim().to_string();
+                                                    }
+                                                    if let Some(y) = tag.year() {
+                                                        year_str = y.to_string();
+                                                    }
+                                                }
+                                            }
+
+                                            metadata_edit_modal = Some(MetadataEditState {
+                                                track_path: track.path.clone(),
+                                                field_idx: 0,
+                                                is_editing: false,
+                                                cursor_pos: 0,
+                                                title: track.title.clone(),
+                                                artist: track.artist.clone(),
+                                                album: track.album.clone(),
+                                                genre,
+                                                year: year_str,
+                                                track_number: track.track_number.map(|n| n.to_string()).unwrap_or_default(),
+                                            });
+                                        }
+                                    }
+                                }
                                 KeyCode::Tab => {
                                     active_focus = match active_focus {
                                         ActiveFocus::ArtistColumn => ActiveFocus::AlbumColumn,
@@ -735,23 +1316,131 @@ fn main() -> color_eyre::Result<()> {
                                 KeyCode::Right | KeyCode::Char('l') => {
                                     active_focus = ActiveFocus::AlbumColumn;
                                 }
-                                KeyCode::Char(' ') => player.toggle_pause(),
+                                KeyCode::Char(' ') => {
+                                    if player.current_track_index.is_some() {
+                                        player.toggle_pause();
+                                    } else if !player.flat_playlist.is_empty() {
+                                        let _ = player.play_index(0);
+                                    }
+                                }
+                                KeyCode::Char('[') | KeyCode::Char(',') => {
+                                    let cur = player.current_elapsed_duration();
+                                    player.seek_to(cur.saturating_sub(Duration::from_secs(5)));
+                                    if let Some(controls) = media_controls.as_mut() {
+                                        update_mpris_state(controls, &player);
+                                    }
+                                }
+                                KeyCode::Char(']') | KeyCode::Char('.') => {
+                                    let cur = player.current_elapsed_duration();
+                                    player.seek_to(cur + Duration::from_secs(5));
+                                    if let Some(controls) = media_controls.as_mut() {
+                                        update_mpris_state(controls, &player);
+                                    }
+                                }
+                                KeyCode::Char('{') | KeyCode::Char('<') => {
+                                    let cur = player.current_elapsed_duration();
+                                    player.seek_to(cur.saturating_sub(Duration::from_secs(30)));
+                                    if let Some(controls) = media_controls.as_mut() {
+                                        update_mpris_state(controls, &player);
+                                    }
+                                }
+                                KeyCode::Char('}') | KeyCode::Char('>') => {
+                                    let cur = player.current_elapsed_duration();
+                                    player.seek_to(cur + Duration::from_secs(30));
+                                    if let Some(controls) = media_controls.as_mut() {
+                                        update_mpris_state(controls, &player);
+                                    }
+                                }
                                 KeyCode::Char('n') => {
                                     let _ = player.next();
                                 }
                                 KeyCode::Char('p') => {
                                     let _ = player.previous();
                                 }
+                                KeyCode::Home | KeyCode::Char('g') => match active_focus {
+                                    ActiveFocus::ArtistColumn => {
+                                        if total_artist_rows > 0 {
+                                            artist_list_state.select(Some(0));
+                                            album_list_state.select(Some(1));
+                                        }
+                                    }
+                                    ActiveFocus::AlbumColumn => {
+                                        if total_album_rows > 0 {
+                                            album_list_state.select(Some(0));
+                                        }
+                                    }
+                                },
+                                KeyCode::End | KeyCode::Char('G') => match active_focus {
+                                    ActiveFocus::ArtistColumn => {
+                                        if total_artist_rows > 0 {
+                                            artist_list_state.select(Some(total_artist_rows - 1));
+                                            album_list_state.select(Some(1));
+                                        }
+                                    }
+                                    ActiveFocus::AlbumColumn => {
+                                        if total_album_rows > 0 {
+                                            album_list_state.select(Some(total_album_rows - 1));
+                                        }
+                                    }
+                                },
+                                KeyCode::PageUp => match active_focus {
+                                    ActiveFocus::ArtistColumn => {
+                                        if total_artist_rows > 0 {
+                                            let curr = artist_list_state.selected().unwrap_or(0);
+                                            let prev = curr.saturating_sub(10);
+                                            artist_list_state.select(Some(prev));
+                                            album_list_state.select(Some(1));
+                                        }
+                                    }
+                                    ActiveFocus::AlbumColumn => {
+                                        if total_album_rows > 0 {
+                                            let curr = album_list_state.selected().unwrap_or(0);
+                                            let prev = curr.saturating_sub(10);
+                                            album_list_state.select(Some(prev));
+                                        }
+                                    }
+                                },
+                                KeyCode::PageDown => match active_focus {
+                                    ActiveFocus::ArtistColumn => {
+                                        if total_artist_rows > 0 {
+                                            let curr = artist_list_state.selected().unwrap_or(0);
+                                            let next = (curr + 10).min(total_artist_rows - 1);
+                                            artist_list_state.select(Some(next));
+                                            album_list_state.select(Some(1));
+                                        }
+                                    }
+                                    ActiveFocus::AlbumColumn => {
+                                        if total_album_rows > 0 {
+                                            let curr = album_list_state.selected().unwrap_or(0);
+                                            let next = (curr + 10).min(total_album_rows - 1);
+                                            album_list_state.select(Some(next));
+                                        }
+                                    }
+                                },
                                 KeyCode::Enter => {
-                                    if active_focus == ActiveFocus::AlbumColumn {
-                                        if let Some(selected_row) = album_list_state.selected() {
-                                            if let Some(Some(track_idx)) = row_to_track.get(selected_row) {
-                                                let _ = player.play_index(*track_idx);
-                                            } else if let Some(None) = row_to_track.get(selected_row) {
-                                                if let Some(Some(track_idx)) = row_to_track.get(selected_row + 1) {
+                                    match active_focus {
+                                        ActiveFocus::AlbumColumn => {
+                                            if let Some(selected_row) = album_list_state.selected() {
+                                                if let Some(Some(track_idx)) = row_to_track.get(selected_row) {
                                                     let _ = player.play_index(*track_idx);
-                                                    album_list_state.select(Some(selected_row + 1));
+                                                } else if let Some(None) = row_to_track.get(selected_row) {
+                                                    if let Some(Some(track_idx)) = row_to_track.get(selected_row + 1) {
+                                                        let _ = player.play_index(*track_idx);
+                                                        album_list_state.select(Some(selected_row + 1));
+                                                    }
                                                 }
+                                            }
+                                        }
+                                        ActiveFocus::ArtistColumn => {
+                                            active_focus = ActiveFocus::AlbumColumn;
+                                            let first_track_row = row_to_track.iter().position(|r| r.is_some());
+                                            if let Some(target_row) = first_track_row {
+                                                album_list_state.select(Some(target_row));
+                                                if let Some(Some(track_idx)) = row_to_track.get(target_row) {
+                                                    let _ = player.play_index(*track_idx);
+                                                }
+                                            } else if total_album_rows > 0 {
+                                                album_list_state.select(Some(0));
                                             }
                                         }
                                     }
@@ -764,7 +1453,7 @@ fn main() -> color_eyre::Result<()> {
                                                 None => 0,
                                             };
                                             artist_list_state.select(Some(next));
-                                            album_list_state.select(Some(0));
+                                            album_list_state.select(Some(1));
                                         }
                                     }
                                     ActiveFocus::AlbumColumn => {
@@ -785,7 +1474,7 @@ fn main() -> color_eyre::Result<()> {
                                                 None => 0,
                                             };
                                             artist_list_state.select(Some(prev));
-                                            album_list_state.select(Some(0));
+                                            album_list_state.select(Some(1));
                                         }
                                     }
                                     ActiveFocus::AlbumColumn => {

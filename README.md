@@ -67,20 +67,37 @@ Options:
 ## Controls & Shortcuts
 | Key / Input | Action |
 | :--- | :--- |
-| `Space` / `Media Play` | Play / Pause |
 | `j` / `Down` | Move selection down |
 | `k` / `Up` | Move selection up |
-| `Enter` / `Double-Click` | Play selected track |
-| `Tab` / `Left` / `Right` / `h` / `l` | Switch focus between Artists and Albums & Tracks |
+| `Tab` / `Esc` / `Left` / `Right` / `h` / `l` | Switch focus between Artists and Albums & Tracks |
+| `Home` / `g` | Jump to top of active list |
+| `End` / `G` | Jump to bottom of active list |
+| `PageUp` / `PageDown` | Scroll list by 10 items |
+| `Space` / `Media Play` | Play / Pause |
+| `Enter` / `Double-Click` | Play selected track / artist |
 | `n` / `Media Next` | Next track |
 | `p` / `Media Prev` | Previous track |
+| `[` / `]` or `,` / `.` | Seek -5s / +5s |
+| `{` / `}` or `<` / `>` | Seek -30s / +30s |
+| `0` | Restart current track |
+| `s` / `r` / `F5` | Scan / Rescan music folder for changes |
+| `x` / `Media Stop` | Stop playback |
 | `+` / `=` | Increase volume |
 | `-` / `_` | Decrease volume |
+| `m` | Toggle mute / unmute |
 | `Mouse Click / Drag` (Progress) | Seek to track position |
 | `Mouse Click / Drag` (Volume) | Adjust volume level |
 | `Mouse Scroll` | Scroll lists / Adjust volume on controls |
-| `a` / `A` / `?` | Toggle About & Shortcuts overlay |
-| `q` / `Esc` | Quit player |
+| `e` | Edit track metadata (title, artist, album, genre, year, track #) |
+| `a` / `?` | Toggle About & Shortcuts overlay |
+| `q` / `Ctrl+C` | Quit player |
+
+## Bug Reports & Feedback
+Found a bug, have an audio decoding issue, or want to request a feature?
+- Open an issue on GitHub: [Issues Tracker](https://github.com/iapm2024/music-rust/issues)
+- Pull requests and suggestions are welcome!
 
 ## License
-Licensed under GNU General Public License v3. Author: iapizarro.
+Licensed under [GNU General Public License v3](LICENSE).  
+Author: iapizarro (iapm2024).
+

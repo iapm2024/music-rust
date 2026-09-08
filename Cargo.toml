@@ -1,6 +1,6 @@
 [package]
 name = "music-rust"
-version = "0.3.1"
+version = "0.7.2"
 edition = "2024"
 authors = ["iapizarro"]
 description = "Nord-themed Terminal Music Player written in Rust"
@@ -14,6 +14,11 @@ clap = { version = "4.5", features = ["derive"] }
 color-eyre = "0.6"
 lofty = "0.21"
 souvlaki = { version = "0.8.3", default-features = false, features = ["use_zbus"] }
+rayon = "1.10"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+opus-pure = "0.2.1"
+libc = "0.2"
 
 [profile.release]
 opt-level = 3
@@ -21,3 +26,4 @@ lto = true
 codegen-units = 1
 panic = "abort"
 strip = true
+
